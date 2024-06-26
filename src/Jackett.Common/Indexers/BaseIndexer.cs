@@ -39,6 +39,8 @@ namespace Jackett.Common.Indexers
 
         public virtual bool SupportsPagination => false;
 
+        public virtual int PageSize => 0;
+
         public virtual bool IsConfigured { get; protected set; }
         public virtual string[] Tags { get; protected set; }
 
@@ -387,6 +389,9 @@ namespace Jackett.Common.Indexers
                 throw new IndexerException(this, ex);
             }
         }
+
+        public abstract IIndexerRequestGenerator GetRequestGenerator();
+        public abstract IParseIndexerResponse GetParser();
 
         protected abstract Task<IEnumerable<ReleaseInfo>> PerformQuery(TorznabQuery query);
     }
@@ -808,6 +813,104 @@ namespace Jackett.Common.Indexers
 
         protected WebClient webclient;
         protected readonly string downloadUrlBase = "";
+
+        public override IIndexerRequestGenerator GetRequestGenerator() => throw new NotImplementedException();
+
+        public override IParseIndexerResponse GetParser() => throw new NotImplementedException();
+
+        protected override Task<IEnumerable<ReleaseInfo>> PerformQuery(TorznabQuery query)
+        {
+            return FetchReleasesAsync(g => g.GetSearchRequests(query), query);
+        }
+
+        protected virtual async Task<IEnumerable<ReleaseInfo>> FetchReleasesAsync(Func<IIndexerRequestGenerator, IndexerPageableRequestChain> pageableRequestChainSelector, TorznabQuery query)
+        {
+            var releases = new List<ReleaseInfo>();
+
+            var generator = GetRequestGenerator();
+            var parser = GetParser();
+
+            var pageableRequestChain = pageableRequestChainSelector(generator);
+
+            for (var i = 0; i < pageableRequestChain.Tiers; i++)
+            {
+                var pageableRequests = pageableRequestChain.GetTier(i).ToList();
+
+                foreach (var pageableRequest in pageableRequests)
+                {
+                    var pagedReleases = new List<ReleaseInfo>();
+
+                    var pageSize = PageSize;
+
+                    foreach (var request in pageableRequest)
+                    {
+                        var page = await FetchPageAsync(request, parser);
+
+                        pageSize = pageSize == 1 ? page.Releases.Count : pageSize;
+
+                        pagedReleases.AddRange(page.Releases);
+
+                        if (!IsFullPage(page.Releases, pageSize))
+                        {
+                            break;
+                        }
+                    }
+
+                    releases.AddRange(pagedReleases.Where(r => IsValidRelease(r, query.InteractiveSearch)));
+                }
+
+                if (releases.Any())
+                {
+                    break;
+                }
+            }
+
+            return releases;
+        }
+
+        protected virtual bool IsFullPage(IList<ReleaseInfo> page, int pageSize)
+        {
+            return pageSize != 0 && page.Count >= pageSize;
+        }
+
+        protected virtual async Task<IndexerQueryResult> FetchPageAsync(IndexerRequest request, IParseIndexerResponse parser)
+        {
+            var response = await FetchIndexerResponseAsync(request);
+
+            try
+            {
+                var releases = parser.ParseResponse(response).ToList();
+
+                if (releases.Count == 0)
+                {
+                    logger.Trace("No releases found. Response: {0}", response.Content);
+                }
+
+                return new IndexerQueryResult
+                {
+                    Releases = releases,
+                    Response = response.WebResponse
+                };
+            }
+            catch (Exception)
+            {
+                logger.Trace("Unexpected Response content ({0} bytes): {1}", response.WebResponse.ContentBytes.Length, response.WebResponse.ContentString);
+                throw;
+            }
+        }
+
+        protected virtual async Task<IndexerResponse> FetchIndexerResponseAsync(IndexerRequest request)
+        {
+            var response = await RequestWithCookiesAndRetryAsync(
+                request.WebRequest.Url,
+                method: request.WebRequest.Type,
+                headers: request.WebRequest.Headers,
+                rawbody: request.WebRequest.RawBody,
+                emulateBrowser: request.WebRequest.EmulateBrowser
+            );
+
+            return new IndexerResponse(request, response);
+        }
     }
 
     public abstract class BaseCachingWebIndexer : BaseWebIndexer
